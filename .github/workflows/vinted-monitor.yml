@@ -2,7 +2,8 @@ name: Vinted wakeboard monitor
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    # Every 5 minutes, offset from the busiest exact-minute boundaries.
+    - cron: "2-59/5 * * * *"
   workflow_dispatch:
   push:
     branches: [main]
