@@ -188,6 +188,66 @@ def translate_to_russian(text):
         return text
 
 
+def is_listing_photo(url):
+    if not isinstance(url, str):
+        return False
+    clean = url.replace("\\/", "/").strip()
+    if not clean.startswith("http"):
+        return False
+    host = urlparse(clean).netloc.casefold()
+    if "vinted.net" not in host:
+        return False
+    lowered = clean.casefold()
+    blocked = ("avatar", "profile", "icon", "logo", "badge")
+    return not any(word in lowered for word in blocked)
+
+
+def collect_images(soup, documents, source, primary):
+    candidates = []
+    if primary:
+        candidates.append(primary)
+
+    for tag in soup.find_all("meta"):
+        if tag.get("property") in {"og:image", "og:image:url", "og:image:secure_url"}:
+            candidates.append(tag.get("content", ""))
+
+    for document in documents:
+        for key, value in flatten_json(document):
+            if isinstance(value, str) and is_listing_photo(value):
+                candidates.append(value)
+            elif isinstance(value, list) and key.casefold() in {"photos", "images", "pictures"}:
+                for child in value:
+                    if isinstance(child, str):
+                        candidates.append(child)
+                    elif isinstance(child, dict):
+                        for image_key in (
+                            "url", "full_size_url", "large_url", "original_url",
+                            "image_url", "high_resolution_url"
+                        ):
+                            image_url = child.get(image_key)
+                            if image_url:
+                                candidates.append(image_url)
+
+    for match in re.findall(r'https?:\\?/\\?/[^"\s<>]+?vinted\.net[^"\s<>]+', source, re.IGNORECASE):
+        candidates.append(match.replace("\\/", "/"))
+
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        clean = candidate.replace("\\/", "/").replace("&amp;", "&").strip()
+        if not is_listing_photo(clean):
+            continue
+        # Remove only exact duplicates while preserving Vinted's display order.
+        if clean not in seen:
+            seen.add(clean)
+            unique.append(clean)
+
+    print(f"Collected {len(unique)} listing photos")
+    return unique[:10]
+
+
 def read_meta(session, url, expected_host):
     response = get(session, url, expected_host)
     soup = BeautifulSoup(response.text, "html.parser")
@@ -197,7 +257,8 @@ def read_meta(session, url, expected_host):
 
     title = meta_value(soup, "og:title") or "Новое wakeboard-объявление"
     description = meta_value(soup, "og:description") or meta_value(soup, "description")
-    image = meta_value(soup, "og:image")
+    primary_image = meta_value(soup, "og:image")
+    images = collect_images(soup, documents, source, primary_image)
 
     price = first_json_value(documents, ["price", "item_price", "base_price"])
     if isinstance(price, dict):
@@ -256,6 +317,7 @@ def read_meta(session, url, expected_host):
             "price": price,
             "size": size,
             "condition": condition,
+            "photos": len(images),
             "translated": translated_description[:80],
         },
     )
@@ -265,7 +327,8 @@ def read_meta(session, url, expected_host):
         "title": title,
         "description": description,
         "description_ru": translated_description,
-        "image": image,
+        "image": images[0] if images else primary_image,
+        "images": images,
         "price": price or "Не удалось определить",
         "size": size or "Не указан",
         "condition": translated_condition or condition or "Не указано",
