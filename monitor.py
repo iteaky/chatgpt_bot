@@ -188,6 +188,61 @@ def translate_to_russian(text):
         return text
 
 
+def clean_title(title):
+    title = (title or "").strip()
+    title = re.sub(r"\s*[|–—-]\s*Vinted(?:\.[a-z]{2})?.*$", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\s*\|\s*Vinted.*$", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\bVinted\b", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\s{2,}", " ", title).strip(" -–—|")
+    return title or "Новое объявление"
+
+
+def normalize_price(value, documents, source, fallback_text):
+    currency = first_json_value(documents, [
+        "currency_code", "currency", "price_currency", "currencyCode"
+    ])
+    currency = str(currency or "EUR").upper()
+
+    amount = None
+    if isinstance(value, dict):
+        amount = value.get("amount") or value.get("value") or value.get("price")
+        currency = str(
+            value.get("currency_code")
+            or value.get("currency")
+            or value.get("currencyCode")
+            or currency
+        ).upper()
+    elif value not in (None, ""):
+        text = str(value).strip()
+        money_match = re.search(
+            r"(\d+(?:[.,]\d{1,2})?)\s*(EUR|USD|GBP|CZK|PLN|HUF|CHF|€|\$|£)?",
+            text,
+            re.IGNORECASE,
+        )
+        if money_match:
+            amount = money_match.group(1)
+            symbol = (money_match.group(2) or "").upper()
+            currency = {"€": "EUR", "$": "USD", "£": "GBP"}.get(symbol, symbol or currency)
+
+    if amount is None:
+        amount = regex_value(
+            fallback_text,
+            [
+                r"(?:€|EUR)\s*(\d+(?:[.,]\d{1,2})?)",
+                r"(\d+(?:[.,]\d{1,2})?)\s*(?:€|EUR)",
+            ],
+        )
+        if amount:
+            currency = "EUR"
+
+    if amount is None:
+        source_amount = json_string_from_source(source, ["amount", "price_amount"])
+        if source_amount and re.fullmatch(r"\d+(?:[.,]\d{1,2})?", source_amount):
+            amount = source_amount
+
+    return f"{amount} {currency}" if amount is not None else "Не удалось определить"
+
+
 def is_listing_photo(url):
     if not isinstance(url, str):
         return False
@@ -239,7 +294,6 @@ def collect_images(soup, documents, source, primary):
         clean = candidate.replace("\\/", "/").replace("&amp;", "&").strip()
         if not is_listing_photo(clean):
             continue
-        # Remove only exact duplicates while preserving Vinted's display order.
         if clean not in seen:
             seen.add(clean)
             unique.append(clean)
@@ -255,24 +309,19 @@ def read_meta(session, url, expected_host):
     page_text = " ".join(soup.stripped_strings)
     source = response.text
 
-    title = meta_value(soup, "og:title") or "Новое wakeboard-объявление"
+    original_title = clean_title(meta_value(soup, "og:title") or "Новое объявление")
+    translated_title = clean_title(translate_to_russian(original_title))
     description = meta_value(soup, "og:description") or meta_value(soup, "description")
     primary_image = meta_value(soup, "og:image")
     images = collect_images(soup, documents, source, primary_image)
 
-    price = first_json_value(documents, ["price", "item_price", "base_price"])
-    if isinstance(price, dict):
-        amount = price.get("amount") or price.get("value")
-        currency = price.get("currency_code") or price.get("currency") or "EUR"
-        price = f"{amount} {currency}" if amount is not None else ""
-    elif price:
-        price = str(price)
-    else:
-        amount = regex_value(
-            f"{title} {description} {page_text}",
-            [r"(?:€|EUR)\s*(\d+(?:[.,]\d{1,2})?)", r"(\d+(?:[.,]\d{1,2})?)\s*(?:€|EUR)"],
-        )
-        price = f"{amount} EUR" if amount else "Не удалось определить"
+    raw_price = first_json_value(documents, ["price", "item_price", "base_price"])
+    price = normalize_price(
+        raw_price,
+        documents,
+        source,
+        f"{original_title} {description} {page_text}",
+    )
 
     size = normalize_size(first_json_value(documents, [
         "size_title", "size", "item_size", "size_name", "size_label"
@@ -290,7 +339,7 @@ def read_meta(session, url, expected_host):
             ],
         ))
     if not size:
-        size = normalize_size(f"{title} {description}")
+        size = normalize_size(f"{original_title} {description}")
 
     condition = normalize_condition(first_json_value(documents, [
         "status_title", "condition_title", "item_condition", "condition", "status"
@@ -314,6 +363,7 @@ def read_meta(session, url, expected_host):
     print(
         "Parsed details:",
         {
+            "title": translated_title,
             "price": price,
             "size": size,
             "condition": condition,
@@ -324,12 +374,13 @@ def read_meta(session, url, expected_host):
 
     return {
         "url": response.url,
-        "title": title,
+        "title": translated_title,
+        "original_title": original_title,
         "description": description,
         "description_ru": translated_description,
         "image": images[0] if images else primary_image,
         "images": images,
-        "price": price or "Не удалось определить",
+        "price": price,
         "size": size or "Не указан",
         "condition": translated_condition or condition or "Не указано",
     }
