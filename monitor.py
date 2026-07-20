@@ -148,7 +148,11 @@ def normalize_size(value):
             if value.get(key):
                 return str(value[key]).strip()
     text = str(value).strip()
-    match = re.search(r"\b(XXXS|XXS|XS|S/M|S|M/L|M|L/XL|L|XL|XXL|XXXL|\d{2,3})\b", text, re.IGNORECASE)
+    match = re.search(
+        r"\b(XXXS|XXS|XS|S/M|S|M/L|M|L/XL|L|XL|XXL|XXXL|\d{2,3})\b",
+        text,
+        re.IGNORECASE,
+    )
     return match.group(1).upper() if match else text
 
 
@@ -190,7 +194,12 @@ def translate_to_russian(text):
 
 def clean_title(title):
     title = (title or "").strip()
-    title = re.sub(r"\s*[|–—-]\s*Vinted(?:\.[a-z]{2})?.*$", "", title, flags=re.IGNORECASE)
+    title = re.sub(
+        r"\s*[|–—-]\s*Vinted(?:\.[a-z]{2})?.*$",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
     title = re.sub(r"\s*\|\s*Vinted.*$", "", title, flags=re.IGNORECASE)
     title = re.sub(r"\bVinted\b", "", title, flags=re.IGNORECASE)
     title = re.sub(r"\s{2,}", " ", title).strip(" -–—|")
@@ -198,12 +207,13 @@ def clean_title(title):
 
 
 def normalize_price(value, documents, source, fallback_text):
-    currency = first_json_value(documents, [
-        "currency_code", "currency", "price_currency", "currencyCode"
-    ])
+    currency = first_json_value(
+        documents,
+        ["currency_code", "currency", "price_currency", "currencyCode"],
+    )
     currency = str(currency or "EUR").upper()
-
     amount = None
+
     if isinstance(value, dict):
         amount = value.get("amount") or value.get("value") or value.get("price")
         currency = str(
@@ -213,16 +223,18 @@ def normalize_price(value, documents, source, fallback_text):
             or currency
         ).upper()
     elif value not in (None, ""):
-        text = str(value).strip()
-        money_match = re.search(
+        match = re.search(
             r"(\d+(?:[.,]\d{1,2})?)\s*(EUR|USD|GBP|CZK|PLN|HUF|CHF|€|\$|£)?",
-            text,
+            str(value),
             re.IGNORECASE,
         )
-        if money_match:
-            amount = money_match.group(1)
-            symbol = (money_match.group(2) or "").upper()
-            currency = {"€": "EUR", "$": "USD", "£": "GBP"}.get(symbol, symbol or currency)
+        if match:
+            amount = match.group(1)
+            symbol = (match.group(2) or "").upper()
+            currency = {"€": "EUR", "$": "USD", "£": "GBP"}.get(
+                symbol,
+                symbol or currency,
+            )
 
     if amount is None:
         amount = regex_value(
@@ -253,12 +265,110 @@ def is_listing_photo(url):
     if "vinted.net" not in host:
         return False
     lowered = clean.casefold()
-    blocked = ("avatar", "profile", "icon", "logo", "badge")
-    return not any(word in lowered for word in blocked)
+    return not any(word in lowered for word in ("avatar", "profile", "icon", "logo", "badge"))
 
 
-def collect_images(soup, documents, source, primary):
+def best_photo_url(photo):
+    if isinstance(photo, str):
+        return photo
+    if not isinstance(photo, dict):
+        return ""
+
+    for key in (
+        "full_size_url",
+        "high_resolution_url",
+        "original_url",
+        "large_url",
+        "image_url",
+        "url",
+    ):
+        value = photo.get(key)
+        if is_listing_photo(value):
+            return value
+
+    thumbnails = photo.get("thumbnails") or []
+    if isinstance(thumbnails, list):
+        ranked = sorted(
+            (item for item in thumbnails if isinstance(item, dict)),
+            key=lambda item: int(item.get("width") or 0) * int(item.get("height") or 0),
+            reverse=True,
+        )
+        for thumbnail in ranked:
+            value = thumbnail.get("url")
+            if is_listing_photo(value):
+                return value
+    return ""
+
+
+def extract_photo_lists(value):
+    result = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key.casefold() in {"photos", "images", "pictures"} and isinstance(child, list):
+                photos = [best_photo_url(item) for item in child]
+                photos = [photo for photo in photos if photo]
+                if photos:
+                    result.extend(photos)
+            result.extend(extract_photo_lists(child))
+    elif isinstance(value, list):
+        for child in value:
+            result.extend(extract_photo_lists(child))
+    return result
+
+
+def fetch_item_api(session, expected_host, item_id, referer):
+    api_url = f"https://{expected_host}/api/v2/items/{item_id}"
+    try:
+        response = session.get(
+            api_url,
+            headers={
+                "Accept": "application/json, text/plain, */*",
+                "Referer": referer,
+                "X-Requested-With": "XMLHttpRequest",
+            },
+            timeout=25,
+        )
+        print(f"GET {api_url} -> {response.status_code} ({len(response.content)} bytes)")
+        if response.status_code != 200:
+            return None
+        return response.json()
+    except Exception as error:
+        print(f"Item API failed for {item_id}: {type(error).__name__}: {error}", file=sys.stderr)
+        return None
+
+
+def photo_identity(url):
+    match = re.search(r"/t/([^/?]+)", url)
+    if match:
+        return match.group(1)
+    return url.split("?", 1)[0]
+
+
+def image_is_reachable(session, url, referer):
+    try:
+        response = session.get(
+            url,
+            headers={"Referer": referer, "Range": "bytes=0-2047"},
+            stream=True,
+            timeout=15,
+        )
+        content_type = response.headers.get("Content-Type", "").casefold()
+        ok = response.status_code in {200, 206} and content_type.startswith("image/")
+        response.close()
+        return ok
+    except requests.RequestException:
+        return False
+
+
+def collect_images(session, soup, documents, source, primary, api_data, referer):
     candidates = []
+
+    if api_data:
+        candidates.extend(extract_photo_lists(api_data))
+
+    for document in documents:
+        candidates.extend(extract_photo_lists(document))
+
     if primary:
         candidates.append(primary)
 
@@ -266,54 +376,67 @@ def collect_images(soup, documents, source, primary):
         if tag.get("property") in {"og:image", "og:image:url", "og:image:secure_url"}:
             candidates.append(tag.get("content", ""))
 
-    for document in documents:
-        for key, value in flatten_json(document):
-            if isinstance(value, str) and is_listing_photo(value):
-                candidates.append(value)
-            elif isinstance(value, list) and key.casefold() in {"photos", "images", "pictures"}:
-                for child in value:
-                    if isinstance(child, str):
-                        candidates.append(child)
-                    elif isinstance(child, dict):
-                        for image_key in (
-                            "url", "full_size_url", "large_url", "original_url",
-                            "image_url", "high_resolution_url"
-                        ):
-                            image_url = child.get(image_key)
-                            if image_url:
-                                candidates.append(image_url)
-
-    for match in re.findall(r'https?:\\?/\\?/[^"\s<>]+?vinted\.net[^"\s<>]+', source, re.IGNORECASE):
+    # Vinted may serialize the gallery as escaped JSON inside a script.
+    for match in re.findall(
+        r'https?:\\?/\\?/[^"\s<>]+?vinted\.net[^"\s<>]+',
+        source,
+        re.IGNORECASE,
+    ):
         candidates.append(match.replace("\\/", "/"))
 
     unique = []
-    seen = set()
+    identities = set()
     for candidate in candidates:
         if not isinstance(candidate, str):
             continue
         clean = candidate.replace("\\/", "/").replace("&amp;", "&").strip()
         if not is_listing_photo(clean):
             continue
-        if clean not in seen:
-            seen.add(clean)
-            unique.append(clean)
+        identity = photo_identity(clean)
+        if identity in identities:
+            continue
+        identities.add(identity)
+        unique.append(clean)
 
-    print(f"Collected {len(unique)} listing photos")
-    return unique[:10]
+    working = []
+    for image in unique:
+        if image_is_reachable(session, image, referer):
+            working.append(image)
+        else:
+            print(f"Skipping unreachable photo: {image[:120]}")
+        if len(working) == 10:
+            break
+
+    print(
+        f"Collected {len(unique)} unique photo candidates; "
+        f"validated {len(working)} photos"
+    )
+    return working
 
 
-def read_meta(session, url, expected_host):
+def read_meta(session, url, expected_host, item_id):
     response = get(session, url, expected_host)
     soup = BeautifulSoup(response.text, "html.parser")
     documents = embedded_json(soup)
     page_text = " ".join(soup.stripped_strings)
     source = response.text
+    api_data = fetch_item_api(session, expected_host, item_id, response.url)
+    if api_data:
+        documents.append(api_data)
 
     original_title = clean_title(meta_value(soup, "og:title") or "Новое объявление")
     translated_title = clean_title(translate_to_russian(original_title))
     description = meta_value(soup, "og:description") or meta_value(soup, "description")
     primary_image = meta_value(soup, "og:image")
-    images = collect_images(soup, documents, source, primary_image)
+    images = collect_images(
+        session,
+        soup,
+        documents,
+        source,
+        primary_image,
+        api_data,
+        response.url,
+    )
 
     raw_price = first_json_value(documents, ["price", "item_price", "base_price"])
     price = normalize_price(
@@ -323,31 +446,45 @@ def read_meta(session, url, expected_host):
         f"{original_title} {description} {page_text}",
     )
 
-    size = normalize_size(first_json_value(documents, [
-        "size_title", "size", "item_size", "size_name", "size_label"
-    ]))
+    size = normalize_size(
+        first_json_value(
+            documents,
+            ["size_title", "size", "item_size", "size_name", "size_label"],
+        )
+    )
     if not size:
-        size = normalize_size(json_string_from_source(source, [
-            "size_title", "size_name", "size_label", "item_size"
-        ]))
+        size = normalize_size(
+            json_string_from_source(
+                source,
+                ["size_title", "size_name", "size_label", "item_size"],
+            )
+        )
     if not size:
-        size = normalize_size(regex_value(
-            page_text,
-            [
-                r"(?:Size|Veľkosť|Größe)\s*[:\-]?\s*(XXXS|XXS|XS|S/M|S|M/L|M|L/XL|L|XL|XXL|XXXL|\d{2,3})\b",
-                r"\b(?:Größe|Veľkosť)\s+(XXXS|XXS|XS|S/M|S|M/L|M|L/XL|L|XL|XXL|XXXL)\b",
-            ],
-        ))
+        size = normalize_size(
+            regex_value(
+                page_text,
+                [
+                    r"(?:Size|Veľkosť|Größe)\s*[:\-]?\s*(XXXS|XXS|XS|S/M|S|M/L|M|L/XL|L|XL|XXL|XXXL|\d{2,3})\b",
+                    r"\b(?:Größe|Veľkosť)\s+(XXXS|XXS|XS|S/M|S|M/L|M|L/XL|L|XL|XXL|XXXL)\b",
+                ],
+            )
+        )
     if not size:
         size = normalize_size(f"{original_title} {description}")
 
-    condition = normalize_condition(first_json_value(documents, [
-        "status_title", "condition_title", "item_condition", "condition", "status"
-    ]))
+    condition = normalize_condition(
+        first_json_value(
+            documents,
+            ["status_title", "condition_title", "item_condition", "condition", "status"],
+        )
+    )
     if not condition:
-        condition = normalize_condition(json_string_from_source(source, [
-            "status_title", "condition_title", "item_condition"
-        ]))
+        condition = normalize_condition(
+            json_string_from_source(
+                source,
+                ["status_title", "condition_title", "item_condition"],
+            )
+        )
     if not condition:
         condition = regex_value(
             page_text,
@@ -410,9 +547,13 @@ def main():
                 continue
 
             try:
-                item = read_meta(session, item_url, expected_host)
+                item = read_meta(session, item_url, expected_host, item_id)
             except Exception as error:
-                print(f"ERROR while loading item {item_url}: {type(error).__name__}: {error}", file=sys.stderr)
+                print(
+                    f"ERROR while loading item {item_url}: "
+                    f"{type(error).__name__}: {error}",
+                    file=sys.stderr,
+                )
                 continue
 
             item["site"] = site
