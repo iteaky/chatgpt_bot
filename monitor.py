@@ -75,19 +75,166 @@ def find_items(session, search_url, expected_host):
     return unique
 
 
+def meta_value(soup, name):
+    tag = soup.find("meta", attrs={"property": name})
+    if not tag:
+        tag = soup.find("meta", attrs={"name": name})
+    return tag.get("content", "").strip() if tag else ""
+
+
+def flatten_json(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            yield str(key), child
+            yield from flatten_json(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from flatten_json(child)
+
+
+def embedded_json(soup):
+    values = []
+    for script in soup.find_all("script"):
+        raw = script.string or script.get_text("", strip=True)
+        if not raw or len(raw) < 2:
+            continue
+        if script.get("type") == "application/ld+json" or raw.startswith(("{", "[")):
+            try:
+                values.append(json.loads(raw))
+            except json.JSONDecodeError:
+                continue
+    return values
+
+
+def first_json_value(documents, keys):
+    wanted = {key.casefold() for key in keys}
+    for document in documents:
+        for key, value in flatten_json(document):
+            if key.casefold() in wanted and value not in (None, "", [], {}):
+                return value
+    return None
+
+
+def money_from_value(value):
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        amount = value.get("amount") or value.get("value")
+        currency = value.get("currency_code") or value.get("currency") or "EUR"
+        if amount is not None:
+            return f"{amount} {currency}"
+    text = str(value).strip()
+    if not text:
+        return ""
+    if re.fullmatch(r"\d+(?:[.,]\d{1,2})?", text):
+        return f"{text} EUR"
+    return text
+
+
+def regex_value(text, patterns):
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
 def read_meta(session, url, expected_host):
     response = get(session, url, expected_host)
     soup = BeautifulSoup(response.text, "html.parser")
+    documents = embedded_json(soup)
+    page_text = " ".join(soup.stripped_strings)
+    source = response.text
 
-    def value(name):
-        tag = soup.find("meta", attrs={"property": name})
-        return tag.get("content", "") if tag else ""
+    title = meta_value(soup, "og:title") or "Новое wakeboard-объявление"
+    description = meta_value(soup, "og:description") or meta_value(soup, "description")
+    image = meta_value(soup, "og:image")
+
+    price = money_from_value(first_json_value(documents, [
+        "price", "item_price", "base_price", "discounted_price"
+    ]))
+    if not price:
+        price = regex_value(
+            f"{title} {description} {page_text}",
+            [r"(?:€|EUR)\s*(\d+(?:[.,]\d{1,2})?)", r"(\d+(?:[.,]\d{1,2})?)\s*(?:€|EUR)"],
+        )
+        if price:
+            price = f"{price} EUR"
+
+    buyer_fee = money_from_value(first_json_value(documents, [
+        "buyer_protection_fee", "buyer_fee", "service_fee", "protection_fee"
+    ]))
+    if not buyer_fee:
+        buyer_fee = regex_value(
+            page_text,
+            [
+                r"(?:buyer protection|käuferschutz|ochrana kupujúceho)[^€\d]{0,40}(\d+(?:[.,]\d{1,2})?\s*€)",
+                r"(\d+(?:[.,]\d{1,2})?\s*€)[^\n]{0,40}(?:buyer protection|käuferschutz|ochrana kupujúceho)",
+            ],
+        )
+
+    shipping = money_from_value(first_json_value(documents, [
+        "shipping_price", "shipping_cost", "postage_price", "delivery_price"
+    ]))
+    if not shipping:
+        shipping = regex_value(
+            page_text,
+            [
+                r"(?:shipping|versand|doprava|poštovné)[^€\d]{0,40}(\d+(?:[.,]\d{1,2})?\s*€)",
+                r"(\d+(?:[.,]\d{1,2})?\s*€)[^\n]{0,40}(?:shipping|versand|doprava|poštovné)",
+            ],
+        )
+
+    seller_name = first_json_value(documents, [
+        "seller_name", "username", "login", "user_name"
+    ])
+    seller_rating = first_json_value(documents, [
+        "rating", "feedback_reputation", "seller_rating", "average_rating"
+    ])
+    review_count = first_json_value(documents, [
+        "feedback_count", "reviews_count", "review_count", "ratings_count"
+    ])
+
+    if not seller_rating:
+        seller_rating = regex_value(
+            page_text,
+            [
+                r"(\d(?:[.,]\d{1,2})?)\s*(?:/\s*5|★)",
+                r"(?:rating|bewertung|hodnotenie)\s*[:\-]?\s*(\d(?:[.,]\d{1,2})?)",
+            ],
+        )
+
+    size = first_json_value(documents, ["size_title", "size", "item_size"])
+    condition = first_json_value(documents, [
+        "status", "condition", "item_condition", "status_title"
+    ])
+
+    # Keep a small diagnostic hint in Actions logs without exposing cookies.
+    print(
+        "Parsed details:",
+        {
+            "price": price,
+            "buyer_fee": buyer_fee,
+            "shipping": shipping,
+            "seller": seller_name,
+            "rating": seller_rating,
+            "reviews": review_count,
+        },
+    )
 
     return {
         "url": response.url,
-        "title": value("og:title") or "Новое wakeboard-объявление",
-        "description": value("og:description"),
-        "image": value("og:image"),
+        "title": title,
+        "description": description,
+        "image": image,
+        "price": price or "Не удалось определить",
+        "buyer_fee": buyer_fee or "Не показана публично",
+        "shipping": shipping or "Рассчитывается Vinted по адресу и способу доставки",
+        "seller_name": str(seller_name) if seller_name else "Не удалось определить",
+        "seller_rating": str(seller_rating) if seller_rating else "Нет данных",
+        "review_count": str(review_count) if review_count else "Нет данных",
+        "size": str(size) if size else "Не указан",
+        "condition": str(condition) if condition else "Не указано",
     }
 
 
@@ -123,7 +270,7 @@ def main():
             item["site"] = site
             item["summary"] = (
                 "Новое объявление по запросу wakeboard. "
-                "Проверь цену, размер, состояние и комплектность."
+                "Проверь размер, состояние, комплектность и итоговую цену перед покупкой."
             )
             fresh.append(item)
             seen.add(key)
