@@ -1,5 +1,6 @@
 import json
 import re
+import sys
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -12,6 +13,16 @@ SITES = {
 }
 STATE = Path("seen.json")
 OUTPUT = Path("new_items.json")
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "sk-SK,sk;q=0.9,de-AT;q=0.8,en;q=0.7",
+    "Cache-Control": "no-cache",
+}
 
 
 def load_seen():
@@ -20,9 +31,15 @@ def load_seen():
     return set(json.loads(STATE.read_text(encoding="utf-8")).get("seen", []))
 
 
-def find_items(search_url):
-    response = requests.get(search_url, timeout=25)
+def get(session, url):
+    response = session.get(url, headers=HEADERS, timeout=25, allow_redirects=True)
+    print(f"GET {url} -> {response.status_code} ({len(response.content)} bytes)")
     response.raise_for_status()
+    return response
+
+
+def find_items(session, search_url):
+    response = get(session, search_url)
     soup = BeautifulSoup(response.text, "html.parser")
     result = []
 
@@ -32,12 +49,13 @@ def find_items(search_url):
         if match:
             result.append((match.group(1), item_url))
 
-    return list(dict.fromkeys(result))[:40]
+    unique = list(dict.fromkeys(result))[:40]
+    print(f"Parsed {len(unique)} item links from {search_url}")
+    return unique
 
 
-def read_meta(url):
-    response = requests.get(url, timeout=25)
-    response.raise_for_status()
+def read_meta(session, url):
+    response = get(session, url)
     soup = BeautifulSoup(response.text, "html.parser")
 
     def value(name):
@@ -56,14 +74,28 @@ def main():
     seen = load_seen()
     first_run = not seen
     fresh = []
+    successful_sites = 0
+    session = requests.Session()
 
     for site, search_url in SITES.items():
-        for item_id, item_url in find_items(search_url):
+        try:
+            items = find_items(session, search_url)
+            successful_sites += 1
+        except Exception as error:
+            print(f"ERROR while loading {site}: {type(error).__name__}: {error}", file=sys.stderr)
+            continue
+
+        for item_id, item_url in items:
             key = f"{site}:{item_id}"
             if key in seen:
                 continue
 
-            item = read_meta(item_url)
+            try:
+                item = read_meta(session, item_url)
+            except Exception as error:
+                print(f"ERROR while loading item {item_url}: {type(error).__name__}: {error}", file=sys.stderr)
+                continue
+
             item["site"] = site
             item["summary"] = (
                 "Новое объявление по запросу wakeboard. "
@@ -71,6 +103,10 @@ def main():
             )
             fresh.append(item)
             seen.add(key)
+
+    if successful_sites == 0:
+        print("Both Vinted marketplaces failed", file=sys.stderr)
+        return 1
 
     STATE.write_text(
         json.dumps({"seen": sorted(seen)[-3000:]}, ensure_ascii=False, indent=2),
@@ -81,7 +117,8 @@ def main():
         encoding="utf-8",
     )
     print(f"Found {len(fresh)} new items; baseline={first_run}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
