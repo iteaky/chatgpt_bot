@@ -49,6 +49,13 @@ def build_card(item):
     )
 
 
+def build_photo_caption(item):
+    title = escaped(item, "title", "Новое wakeboard-объявление")
+    price = escaped(item, "price")
+    url = html.escape(item["url"], quote=True)
+    return f"<b>{title}</b> — <b>{price}</b>\n<a href=\"{url}\">Открыть объявление</a>"
+
+
 def send_text(api, chat_id, text):
     response = requests.post(
         api + "/sendMessage",
@@ -110,12 +117,15 @@ def send(item):
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "@from78kg")
     api = "https://api.telegram.org/bot" + token
     card_text = build_card(item)
+    photo_caption = card_text if len(card_text) <= 1024 else build_photo_caption(item)
 
     temp_dir, downloaded = download_image(main_image(item))
     try:
-        if downloaded and len(card_text) <= 1024:
+        if downloaded:
             try:
-                send_photo(api, chat_id, downloaded, card_text)
+                send_photo(api, chat_id, downloaded, photo_caption)
+                if photo_caption != card_text:
+                    send_text(api, chat_id, card_text)
                 return
             except Exception as error:
                 print(f"Photo upload failed: {error}")
