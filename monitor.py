@@ -115,28 +115,77 @@ def first_json_value(documents, keys):
     return None
 
 
-def money_from_value(value):
-    if value is None:
-        return ""
-    if isinstance(value, dict):
-        amount = value.get("amount") or value.get("value")
-        currency = value.get("currency_code") or value.get("currency") or "EUR"
-        if amount is not None:
-            return f"{amount} {currency}"
-    text = str(value).strip()
-    if not text:
-        return ""
-    if re.fullmatch(r"\d+(?:[.,]\d{1,2})?", text):
-        return f"{text} EUR"
-    return text
-
-
 def regex_value(text, patterns):
     for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
+        match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
         if match:
             return match.group(1).strip()
     return ""
+
+
+def json_string_from_source(source, keys):
+    for key in keys:
+        patterns = [
+            rf'"{re.escape(key)}"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
+            rf'\\"{re.escape(key)}\\"\s*:\s*\\"([^"\\]*(?:\\.[^"\\]*)*)\\"',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, source, re.IGNORECASE)
+            if match:
+                raw = match.group(1)
+                try:
+                    return json.loads(f'"{raw}"')
+                except json.JSONDecodeError:
+                    return raw.replace("\\/", "/").replace('\\"', '"')
+    return ""
+
+
+def normalize_size(value):
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        for key in ("title", "name", "label", "value"):
+            if value.get(key):
+                return str(value[key]).strip()
+    text = str(value).strip()
+    match = re.search(r"\b(XXXS|XXS|XS|S/M|S|M/L|M|L/XL|L|XL|XXL|XXXL|\d{2,3})\b", text, re.IGNORECASE)
+    return match.group(1).upper() if match else text
+
+
+def normalize_condition(value):
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        for key in ("title", "name", "label", "value"):
+            if value.get(key):
+                return str(value[key]).strip()
+    return str(value).strip()
+
+
+def translate_to_russian(text):
+    text = (text or "").strip()
+    if not text:
+        return ""
+    try:
+        response = requests.get(
+            "https://translate.googleapis.com/translate_a/single",
+            params={
+                "client": "gtx",
+                "sl": "auto",
+                "tl": "ru",
+                "dt": "t",
+                "q": text[:1500],
+            },
+            headers=BASE_HEADERS,
+            timeout=20,
+        )
+        response.raise_for_status()
+        data = response.json()
+        translated = "".join(part[0] for part in data[0] if part and part[0])
+        return translated.strip() or text
+    except Exception as error:
+        print(f"Translation failed: {type(error).__name__}: {error}", file=sys.stderr)
+        return text
 
 
 def read_meta(session, url, expected_host):
@@ -150,75 +199,64 @@ def read_meta(session, url, expected_host):
     description = meta_value(soup, "og:description") or meta_value(soup, "description")
     image = meta_value(soup, "og:image")
 
-    price = money_from_value(first_json_value(documents, [
-        "price", "item_price", "base_price", "discounted_price"
-    ]))
-    if not price:
-        price = regex_value(
+    price = first_json_value(documents, ["price", "item_price", "base_price"])
+    if isinstance(price, dict):
+        amount = price.get("amount") or price.get("value")
+        currency = price.get("currency_code") or price.get("currency") or "EUR"
+        price = f"{amount} {currency}" if amount is not None else ""
+    elif price:
+        price = str(price)
+    else:
+        amount = regex_value(
             f"{title} {description} {page_text}",
             [r"(?:€|EUR)\s*(\d+(?:[.,]\d{1,2})?)", r"(\d+(?:[.,]\d{1,2})?)\s*(?:€|EUR)"],
         )
-        if price:
-            price = f"{price} EUR"
+        price = f"{amount} EUR" if amount else "Не удалось определить"
 
-    buyer_fee = money_from_value(first_json_value(documents, [
-        "buyer_protection_fee", "buyer_fee", "service_fee", "protection_fee"
+    size = normalize_size(first_json_value(documents, [
+        "size_title", "size", "item_size", "size_name", "size_label"
     ]))
-    if not buyer_fee:
-        buyer_fee = regex_value(
+    if not size:
+        size = normalize_size(json_string_from_source(source, [
+            "size_title", "size_name", "size_label", "item_size"
+        ]))
+    if not size:
+        size = normalize_size(regex_value(
             page_text,
             [
-                r"(?:buyer protection|käuferschutz|ochrana kupujúceho)[^€\d]{0,40}(\d+(?:[.,]\d{1,2})?\s*€)",
-                r"(\d+(?:[.,]\d{1,2})?\s*€)[^\n]{0,40}(?:buyer protection|käuferschutz|ochrana kupujúceho)",
+                r"(?:Size|Veľkosť|Größe)\s*[:\-]?\s*(XXXS|XXS|XS|S/M|S|M/L|M|L/XL|L|XL|XXL|XXXL|\d{2,3})\b",
+                r"\b(?:Größe|Veľkosť)\s+(XXXS|XXS|XS|S/M|S|M/L|M|L/XL|L|XL|XXL|XXXL)\b",
             ],
-        )
+        ))
+    if not size:
+        size = normalize_size(f"{title} {description}")
 
-    shipping = money_from_value(first_json_value(documents, [
-        "shipping_price", "shipping_cost", "postage_price", "delivery_price"
+    condition = normalize_condition(first_json_value(documents, [
+        "status_title", "condition_title", "item_condition", "condition", "status"
     ]))
-    if not shipping:
-        shipping = regex_value(
+    if not condition:
+        condition = normalize_condition(json_string_from_source(source, [
+            "status_title", "condition_title", "item_condition"
+        ]))
+    if not condition:
+        condition = regex_value(
             page_text,
             [
-                r"(?:shipping|versand|doprava|poštovné)[^€\d]{0,40}(\d+(?:[.,]\d{1,2})?\s*€)",
-                r"(\d+(?:[.,]\d{1,2})?\s*€)[^\n]{0,40}(?:shipping|versand|doprava|poštovné)",
+                r"(?:Condition|Stav|Zustand)\s*[:\-]?\s*([^|•]{2,50})",
+                r"\b(Neu mit Etikett|Neu ohne Etikett|Sehr gut|Gut|Zufriedenstellend|Nové s visačkou|Nové bez visačky|Veľmi dobré|Dobré|Uspokojivé)\b",
             ],
         )
 
-    seller_name = first_json_value(documents, [
-        "seller_name", "username", "login", "user_name"
-    ])
-    seller_rating = first_json_value(documents, [
-        "rating", "feedback_reputation", "seller_rating", "average_rating"
-    ])
-    review_count = first_json_value(documents, [
-        "feedback_count", "reviews_count", "review_count", "ratings_count"
-    ])
+    translated_description = translate_to_russian(description)
+    translated_condition = translate_to_russian(condition) if condition else ""
 
-    if not seller_rating:
-        seller_rating = regex_value(
-            page_text,
-            [
-                r"(\d(?:[.,]\d{1,2})?)\s*(?:/\s*5|★)",
-                r"(?:rating|bewertung|hodnotenie)\s*[:\-]?\s*(\d(?:[.,]\d{1,2})?)",
-            ],
-        )
-
-    size = first_json_value(documents, ["size_title", "size", "item_size"])
-    condition = first_json_value(documents, [
-        "status", "condition", "item_condition", "status_title"
-    ])
-
-    # Keep a small diagnostic hint in Actions logs without exposing cookies.
     print(
         "Parsed details:",
         {
             "price": price,
-            "buyer_fee": buyer_fee,
-            "shipping": shipping,
-            "seller": seller_name,
-            "rating": seller_rating,
-            "reviews": review_count,
+            "size": size,
+            "condition": condition,
+            "translated": translated_description[:80],
         },
     )
 
@@ -226,15 +264,11 @@ def read_meta(session, url, expected_host):
         "url": response.url,
         "title": title,
         "description": description,
+        "description_ru": translated_description,
         "image": image,
         "price": price or "Не удалось определить",
-        "buyer_fee": buyer_fee or "Не показана публично",
-        "shipping": shipping or "Рассчитывается Vinted по адресу и способу доставки",
-        "seller_name": str(seller_name) if seller_name else "Не удалось определить",
-        "seller_rating": str(seller_rating) if seller_rating else "Нет данных",
-        "review_count": str(review_count) if review_count else "Нет данных",
-        "size": str(size) if size else "Не указан",
-        "condition": str(condition) if condition else "Не указано",
+        "size": size or "Не указан",
+        "condition": translated_condition or condition or "Не указано",
     }
 
 
@@ -268,10 +302,6 @@ def main():
                 continue
 
             item["site"] = site
-            item["summary"] = (
-                "Новое объявление по запросу wakeboard. "
-                "Проверь размер, состояние, комплектность и итоговую цену перед покупкой."
-            )
             fresh.append(item)
             seen.add(key)
 
