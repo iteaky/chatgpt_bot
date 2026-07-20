@@ -18,28 +18,19 @@ def send(item):
     api = "https://api.telegram.org/bot" + token
 
     title = escaped(item, "title", "Новое wakeboard-объявление")
-    description = html.escape((item.get("description") or "Описание отсутствует")[:500])
-    summary = escaped(item, "summary", "")
+    description = html.escape(
+        (item.get("description_ru") or item.get("description") or "Описание отсутствует")[:700]
+    )
     site = escaped(item, "site", "Vinted")
     url = html.escape(item["url"], quote=True)
-
-    seller = escaped(item, "seller_name")
-    rating = escaped(item, "seller_rating")
-    reviews = escaped(item, "review_count")
 
     text = (
         f"🏄 <b>{title}</b>\n\n"
         f"🌍 Площадка: {site}\n"
         f"💶 Цена: <b>{escaped(item, 'price')}</b>\n"
-        f"🛡 Комиссия Vinted: {escaped(item, 'buyer_fee')}\n"
-        f"📦 Доставка: {escaped(item, 'shipping')}\n"
         f"📏 Размер: {escaped(item, 'size')}\n"
         f"✨ Состояние: {escaped(item, 'condition')}\n\n"
-        f"👤 Продавец: {seller}\n"
-        f"⭐ Рейтинг: {rating}\n"
-        f"💬 Отзывов: {reviews}\n\n"
-        f"🤖 {summary}\n\n"
-        f"📝 {description}\n\n"
+        f"📝 <b>Описание на русском:</b>\n{description}\n\n"
         f'<a href="{url}">Открыть объявление</a>'
     )
 
