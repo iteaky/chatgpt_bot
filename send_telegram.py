@@ -16,6 +16,7 @@ DOWNLOAD_HEADERS = {
     ),
     "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
 }
+TELEGRAM_CAPTION_LIMIT = 1024
 
 
 def escaped(item, key, fallback="Нет данных"):
@@ -30,30 +31,56 @@ def check_response(response):
     return data
 
 
-def build_card(item):
+def trim_text(text, max_length):
+    text = (text or "").strip()
+    if len(text) <= max_length:
+        return text
+    if max_length <= 1:
+        return "…"[:max_length]
+    return text[: max_length - 1].rstrip() + "…"
+
+
+def build_card(item, caption_limit=None):
     title = escaped(item, "title", "Новое wakeboard-объявление")
     price = escaped(item, "price")
-    description = html.escape(
-        (item.get("description_ru") or item.get("description") or "Описание отсутствует")[:700]
-    )
     site = escaped(item, "site", "Vinted")
+    size = escaped(item, "size")
+    condition = escaped(item, "condition")
     url = html.escape(item["url"], quote=True)
+    raw_description = (
+        item.get("description_ru")
+        or item.get("description")
+        or "Описание отсутствует"
+    )
 
-    return (
+    prefix = (
         f"<b>{title}</b> — <b>{price}</b>\n\n"
         f"🌍 Площадка: {site}\n"
-        f"📏 Размер: {escaped(item, 'size')}\n"
-        f"✨ Состояние: {escaped(item, 'condition')}\n\n"
-        f"📝 <b>Описание на русском:</b>\n{description}\n\n"
-        f'<a href="{url}">Открыть объявление</a>'
+        f"📏 Размер: {size}\n"
+        f"✨ Состояние: {condition}\n\n"
+        f"📝 <b>Описание на русском:</b>\n"
     )
+    suffix = f'\n\n<a href="{url}">Открыть объявление</a>'
 
+    if caption_limit is None:
+        description = html.escape(str(raw_description)[:700])
+        return prefix + description + suffix
 
-def build_photo_caption(item):
-    title = escaped(item, "title", "Новое wakeboard-объявление")
-    price = escaped(item, "price")
-    url = html.escape(item["url"], quote=True)
-    return f"<b>{title}</b> — <b>{price}</b>\n<a href=\"{url}\">Открыть объявление</a>"
+    # Telegram counts the final rendered caption, while HTML tags also occupy
+    # space in the API payload. Keep a small safety margin to avoid rejections.
+    available = max(0, caption_limit - len(prefix) - len(suffix) - 16)
+    description = html.escape(trim_text(str(raw_description), available))
+    card = prefix + description + suffix
+
+    if len(card) <= caption_limit:
+        return card
+
+    # Escaping can increase the payload length (for example, '&' -> '&amp;').
+    # Reduce the source text until the complete HTML caption fits.
+    overflow = len(card) - caption_limit
+    available = max(0, available - overflow - 8)
+    description = html.escape(trim_text(str(raw_description), available))
+    return (prefix + description + suffix)[:caption_limit]
 
 
 def send_text(api, chat_id, text):
@@ -98,7 +125,7 @@ def send_photo(api, chat_id, downloaded, text):
     with path.open("rb") as image_file:
         response = requests.post(
             api + "/sendPhoto",
-            data={"chat_id": chat_id, "caption": text[:1024], "parse_mode": "HTML"},
+            data={"chat_id": chat_id, "caption": text, "parse_mode": "HTML"},
             files={"photo": (path.name, image_file, content_type)},
             timeout=60,
         )
@@ -116,21 +143,19 @@ def send(item):
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "@from78kg")
     api = "https://api.telegram.org/bot" + token
-    card_text = build_card(item)
-    photo_caption = card_text if len(card_text) <= 1024 else build_photo_caption(item)
 
     temp_dir, downloaded = download_image(main_image(item))
     try:
         if downloaded:
+            caption = build_card(item, TELEGRAM_CAPTION_LIMIT)
             try:
-                send_photo(api, chat_id, downloaded, photo_caption)
-                if photo_caption != card_text:
-                    send_text(api, chat_id, card_text)
+                send_photo(api, chat_id, downloaded, caption)
                 return
             except Exception as error:
                 print(f"Photo upload failed: {error}")
 
-        send_text(api, chat_id, card_text)
+        # If no valid photo is available, send one complete text message.
+        send_text(api, chat_id, build_card(item))
     finally:
         temp_dir.cleanup()
 
